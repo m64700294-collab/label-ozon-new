@@ -13,7 +13,7 @@ import requests
 st.set_page_config(page_title="Умная склейка этикеток Ozon", page_icon="🖨️", layout="wide")
 
 st.title("🖨️ Склейка: Этикетки + Лист подбора")
-st.write("Сервис автоматически подбирает размер текста, чтобы всё влезло на этикетку.")
+st.write("Сервис нарезает лист подбора по слоям для 100% захвата названий.")
 
 # --- ЗАГРУЗКА ШРИФТА ---
 @st.cache_resource
@@ -29,71 +29,98 @@ def load_font():
 
 font_name = load_font()
 
-# --- ПАРСИНГ ЛИСТА ПОДБОРА ---
+# --- ПАРСИНГ ЛИСТА ПОДБОРА ПО ГОРИЗОНТАЛЬНЫМ ЛИНИЯМ ---
 def parse_assembly_list(pdf_file):
     data = {}
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # 1. Попытка умного извлечения таблицы (даже без видимых рамок)
-            table = page.extract_table({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text"
-            })
+            # 1. Находим графические линии, чтобы нарезать страницу на товары
+            lines = [line for line in page.lines if line['width'] > 30]
+            lines.sort(key=lambda x: x['top'])
             
-            rows_to_process = []
+            y_coords = [0] + [line['top'] for line in lines] + [page.height]
             
-            if table:
-                # Если таблица нашлась, преобразуем её в текстовые строки
-                for row in table:
-                    row_clean = [str(cell).strip().replace('\n', ' ') if cell else "" for cell in row]
-                    rows_to_process.append(" ".join(row_clean))
-            else:
-                # 2. Надежный запасной вариант: читаем текст с сохранением отступов
-                text = page.extract_text(layout=True)
-                if text:
-                    rows_to_process = text.split('\n')
-            
-            # Обрабатываем каждую строку
-            for line in rows_to_process:
-                # Нормализация (Ozon иногда подсовывает кириллическую 'і')
-                line_norm = line.lower().replace('і', 'i').replace('І', 'i')
+            for i in range(len(y_coords) - 1):
+                top = y_coords[i]
+                bottom = y_coords[i+1]
                 
-                # Ищем номер заказа
-                match = re.search(r'(\d{8,15}-\d{4}-\d+|ii\d{9,15})', line_norm)
-                if match:
-                    order_num = match.group(1)
+                if bottom - top < 15: 
+                    continue
                     
-                    # Очищаем строку от множественных пробелов для удобного поиска
-                    clean_line = re.sub(r'\s+', ' ', line).strip()
+                # 2. Вырезаем горизонтальную полосу (один блок/товар)
+                bbox = (0, top, page.width, bottom)
+                try:
+                    crop = page.within_bbox(bbox)
+                except ValueError:
+                    continue
                     
-                    # Пытаемся вытащить Артикул и Количество с конца строки
-                    # Формат Ozon обычно: ... [Артикул] [Кол-во] [4 цифры этикетки]
-                    info_match = re.search(r'(.*?)\s+(\S+)\s+(\d+)\s+\d{4}$', clean_line)
+                # Читаем текст внутри полосы, сохраняя визуальные пробелы (layout=True)
+                text = crop.extract_text(layout=True)
+                if not text:
+                    continue
                     
-                    # Если в конце нет 4 цифр этикетки, пробуем без них
-                    if not info_match:
-                        info_match = re.search(r'(.*?)\s+(\S+)\s+(\d+)$', clean_line)
-                        
-                    if info_match:
-                        raw_title = info_match.group(1)
-                        # Убираем сам номер заказа из названия (чтобы не дублировался)
-                        name_clean = re.split(order_num, raw_title, flags=re.IGNORECASE)
-                        name = name_clean[-1].strip() if len(name_clean) > 1 else raw_title.strip()
-                        
-                        article = info_match.group(2)
-                        qty = info_match.group(3)
+                # 3. Ищем ВСЕ заказы внутри этой полосы
+                orders_in_slice = re.findall(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z0-9]{0,3}500\d{6,10})', text)
+                if not orders_in_slice:
+                    continue
+                    
+                # 4. Очищаем текст от номеров заказов
+                text_clean = re.sub(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z0-9]{0,3}500\d{6,10})', ' ', text)
+                
+                # 5. УДАЛЯЕМ ПОРЯДКОВЫЕ НОМЕРА (10, 11, 12) в начале строк. 
+                # Они либо отделены палочкой |, либо большим пробелом
+                text_clean = re.sub(r'(?m)^\s*\d+\s*\|', ' ', text_clean)
+                text_clean = re.sub(r'(?m)^\s*\d+\s{3,}', ' ', text_clean)
+                text_clean = text_clean.replace('|', ' ')
+                
+                # 6. Удаляем шапку таблицы (если она попала в срез)
+                headers = r'(Склад МСК ООО.*?|Склад:.*?|Служба доставки:.*?|Номер отправления|Номер с этикетки|Количество отправлений|Дата:|Фото|Товар|Артикул|Кол-во|Этикетка|Ozon|Проверьте список.*?отменять их\.|№)'
+                text_clean = re.sub(headers, ' ', text_clean, flags=re.IGNORECASE)
+                
+                # 7. Ищем Артикул и Кол-во строго в конце строк (используем \s{2,} чтобы случайно не отрезать часть названия)
+                art_qty_matches = list(re.finditer(r'\s{2,}([A-Za-z0-9\-_А-Яа-я/.]+)\s+(\d{1,3})(?:\s+\d{4})?\s*$', text_clean, re.MULTILINE))
+                
+                articles = []
+                qtys = []
+                name_text = text_clean
+                
+                # Вырезаем найденные Артикулы и Количество из текста (идем с конца, чтобы не сбить индексы)
+                for match in reversed(art_qty_matches):
+                    articles.append(match.group(1))
+                    qtys.append(match.group(2))
+                    name_text = name_text[:match.start()] + " " + name_text[match.end():]
+                    
+                articles.reverse()
+                qtys.reverse()
+                
+                # 8. Всё, что осталось после удаления номеров и артикулов — это чистое Название!
+                name = re.sub(r'\s+', ' ', name_text).strip()
+                if not name or len(name) < 2:
+                    name = "Товар"
+                    
+                # 9. Раздаем извлеченные данные всем заказам в этой полосе
+                for j, order in enumerate(orders_in_slice):
+                    art = articles[min(j, len(articles)-1)] if articles else "-"
+                    qty = qtys[min(j, len(qtys)-1)] if qtys else "1"
+                    
+                    item = {"name": name, "article": art, "qty": qty}
+                    
+                    order_norm = order.lower().replace('і', 'i').replace('І', 'i')
+                    
+                    # Привязываем товар по 4 последним цифрам
+                    if '500' in order_norm:
+                        code = order_norm[-4:]
                     else:
-                        # Заглушка, если строка обрезалась
-                        name = "Товар (название на другой строке)"
-                        article = "?"
-                        qty = "1"
+                        code = order_norm.split('-')[0][-4:]
                         
-                    # Сохраняем в словарь
-                    data[order_num] = {
-                        "name": name if name else "Товар",
-                        "article": article,
-                        "qty": qty
-                    }
+                    data[code] = item
+                    
+                    # Резервная привязка по числовому коду
+                    num_key = re.sub(r'\D', '', order_norm)
+                    data[num_key] = item
+                    if len(num_key) >= 10:
+                        data[num_key[-10:]] = item
+                        
     return data
 
 def create_info_label(width, height, order_number, product_info):
@@ -172,19 +199,37 @@ if labels_file and assembly_file:
                 text_no_underscores = re.sub(r'_\d+', '', text)
                 clean_text = re.sub(r'\s+', '', text_no_underscores)
                 
-                # Нормализуем для поиска
                 clean_text_norm = clean_text.lower().replace('і', 'i').replace('І', 'i')
-                
-                order_match = re.search(r'(\d{8,15}-\d{4}-\d+|ii\d{9,15})', clean_text_norm)
+                order_match = re.search(r'(\d{8,15}-\d{4}-\d+|ii\d{9,15}|[a-zA-Z0-9]{0,3}500\d{6,10})', clean_text_norm)
                 
                 w, h = float(page.mediabox.width), float(page.mediabox.height)
                 
                 if order_match:
-                    order_num = order_match.group(1)
-                    info = assembly_data.get(order_num, {"name": "Не найдено", "article": "-", "qty": "?"})
+                    full_num = order_match.group(1)
                     
-                    # Оставляем оригинальный порядок символов, без перевода в заглавные
-                    writer.add_page(create_info_label(w, h, order_num, info))
+                    # Ищем привязку по 4 последним цифрам
+                    if '500' in full_num:
+                        short_code = full_num[-4:]
+                    else:
+                        short_code = full_num.split('-')[0][-4:]
+                        
+                    info = assembly_data.get(short_code)
+                            
+                    # Страховочный поиск по числовому ключу
+                    if not info:
+                        num_key = re.sub(r'\D', '', full_num)
+                        info = assembly_data.get(num_key)
+                        if not info and len(num_key) >= 10:
+                            info = assembly_data.get(num_key[-10:])
+                            
+                    if not info:
+                        info = {"name": "Товар не найден", "article": "-", "qty": "?"}
+                        
+                    display_num = full_num.upper()
+                    if display_num.startswith('II'):
+                        display_num = 'ii' + display_num[2:]
+                        
+                    writer.add_page(create_info_label(w, h, display_num, info))
                 else:
                     writer.add_page(create_info_label(w, h, "???", {"name": "Номер не распознан", "article": "-", "qty": "-"}))
             
