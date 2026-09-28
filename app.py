@@ -13,7 +13,7 @@ import requests
 st.set_page_config(page_title="Умная склейка этикеток Ozon", page_icon="🖨️", layout="wide")
 
 st.title("🖨️ Склейка: Этикетки + Лист подбора")
-st.write("Сервис нарезает лист подбора по слоям для 100% захвата названий.")
+st.write("Сервис нарезает лист подбора по слоям и имеет встроенную защиту от ошибок.")
 
 # --- ЗАГРУЗКА ШРИФТА ---
 @st.cache_resource
@@ -34,7 +34,6 @@ def parse_assembly_list(pdf_file):
     data = {}
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # 1. Находим графические линии для нарезки страницы
             lines = [line for line in page.lines if line['width'] > 30]
             lines.sort(key=lambda x: x['top'])
             
@@ -47,7 +46,6 @@ def parse_assembly_list(pdf_file):
                 if bottom - top < 15: 
                     continue
                     
-                # 2. Вырезаем горизонтальную полосу
                 bbox = (0, top, page.width, bottom)
                 try:
                     crop = page.within_bbox(bbox)
@@ -58,14 +56,12 @@ def parse_assembly_list(pdf_file):
                 if not text:
                     continue
                     
-                # 3. Ищем ВСЕ заказы внутри этой полосы (любые серии Ozon)
                 order_pattern = r'(\d{8,15}-\d{4}-\d+|[a-zA-Z]{0,4}\d{10,15})'
                 orders_in_slice = re.findall(order_pattern, text)
                 
                 if not orders_in_slice:
                     continue
                     
-                # Вычисляем 4-значные коды, чтобы потом вырезать их из названия
                 short_codes = []
                 for order in orders_in_slice:
                     order_norm = order.lower().replace('і', 'i').replace('І', 'i')
@@ -74,22 +70,18 @@ def parse_assembly_list(pdf_file):
                     else:
                         short_codes.append(order_norm.split('-')[0][-4:])
                         
-                # 4. Очищаем текст от номеров заказов
                 text_clean = re.sub(order_pattern, ' ', text)
                 
-                # 5. Удаляем шапку таблицы и палочки
                 headers = r'(Склад МСК ООО.*?|Склад:.*?|Служба доставки:.*?|Номер отправления|Номер с этикетки|Количество отправлений|Дата:|Фото|Товар|Артикул|Кол-во|Этикетка|Ozon|Проверьте список.*?отменять их\.|№)'
                 text_clean = re.sub(headers, ' ', text_clean, flags=re.IGNORECASE)
                 text_clean = text_clean.replace('|', ' ')
                 
-                # 6. Ищем Артикул и Кол-во (ТЕПЕРЬ ДОСТАТОЧНО 1 ПРОБЕЛА: \s+)
                 art_qty_matches = list(re.finditer(r'\s+([A-Za-z0-9\-_А-Яа-я/.]+)\s+(\d{1,4})(?:\s+\d{4})?\s*$', text_clean, re.MULTILINE))
                 
                 articles = []
                 qtys = []
                 name_text = text_clean
                 
-                # Вырезаем найденные Артикулы и Количество из текста
                 for match in reversed(art_qty_matches):
                     articles.append(match.group(1))
                     qtys.append(match.group(2))
@@ -98,21 +90,15 @@ def parse_assembly_list(pdf_file):
                 articles.reverse()
                 qtys.reverse()
                 
-                # 7. ГЕНЕРАЛЬНАЯ УБОРКА НАЗВАНИЯ ТОВАРА
-                # Удаляем ВСЕ порядковые номера в начале строк (даже если их несколько подряд)
                 name_text = re.sub(r'(?m)^\s*(?:\d+\s+)+', ' ', name_text)
-                
-                # Удаляем 4-значные коды этикеток, если Озон засунул их внутрь текста
                 for code in short_codes:
                     if code.isdigit():
                         name_text = re.sub(rf'\b{code}\b', ' ', name_text)
                         
-                # Убираем лишние пробелы
                 name = re.sub(r'\s+', ' ', name_text).strip()
                 if not name or len(name) < 2:
                     name = "Товар"
                     
-                # 8. Раздаем извлеченные данные заказам
                 for j, order in enumerate(orders_in_slice):
                     art = articles[min(j, len(articles)-1)] if articles else "-"
                     qty = qtys[min(j, len(qtys)-1)] if qtys else "1"
@@ -198,12 +184,19 @@ with col2:
 
 if labels_file and assembly_file:
     if st.button("🚀 Склеить файлы", type="primary", use_container_width=True):
-        with st.status("Склеиваем...") as status:
+        # Переменные для аналитики
+        total_labels = 0
+        success_count = 0
+        error_orders = []
+        
+        with st.status("Анализ и склейка...") as status:
             assembly_data = parse_assembly_list(assembly_file)
             reader = PdfReader(labels_file)
             writer = PdfWriter()
             
-            for i in range(len(reader.pages)):
+            total_labels = len(reader.pages)
+            
+            for i in range(total_labels):
                 page = reader.pages[i]
                 writer.add_page(page)
                 
@@ -232,21 +225,40 @@ if labels_file and assembly_file:
                         if not info and len(num_key) >= 10:
                             info = assembly_data.get(num_key[-10:])
                             
-                    if not info:
-                        info = {"name": "Товар не найден", "article": "-", "qty": "?"}
-                        
+                    # Проверка на успех
                     display_num = full_num.upper()
                     if display_num.startswith('II'):
                         display_num = 'ii' + display_num[2:]
                         
+                    if not info:
+                        info = {"name": "Товар не найден", "article": "-", "qty": "?"}
+                        error_orders.append(display_num)
+                    else:
+                        success_count += 1
+                        
                     writer.add_page(create_info_label(w, h, display_num, info))
                 else:
                     writer.add_page(create_info_label(w, h, "???", {"name": "Номер не распознан", "article": "-", "qty": "-"}))
+                    error_orders.append("Неизвестный номер на этикетке")
             
-            status.update(label="Готово!", state="complete")
+            status.update(label="Обработка завершена!", state="complete")
+            
+        # Блок диагностики
+        st.divider()
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Всего этикеток", total_labels)
+        col_m2.metric("Успешно привязано", success_count)
+        col_m3.metric("Ошибок", total_labels - success_count)
+        
+        if success_count == total_labels:
+            st.success("✅ Все товары идеально сопоставлены! Можно печатать.")
+        else:
+            st.error(f"⚠️ Внимание! Не удалось найти {total_labels - success_count} товара(ов). Озон снова изменил формат для этих номеров:")
+            for err in error_orders:
+                st.markdown(f"- **{err}**")
             
         output = BytesIO()
         writer.write(output)
         output.seek(0)
         
-        st.download_button("📥 Скачать результат", output, "Ready_Labels.pdf", "application/pdf")
+        st.download_button("📥 Скачать PDF для печати", output, "Ready_Labels.pdf", "application/pdf", type="primary")
