@@ -34,7 +34,7 @@ def parse_assembly_list(pdf_file):
     data = {}
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # 1. Находим графические линии, чтобы нарезать страницу на товары
+            # 1. Находим графические линии для нарезки страницы
             lines = [line for line in page.lines if line['width'] > 30]
             lines.sort(key=lambda x: x['top'])
             
@@ -47,40 +47,43 @@ def parse_assembly_list(pdf_file):
                 if bottom - top < 15: 
                     continue
                     
-                # 2. Вырезаем горизонтальную полосу (один блок/товар)
+                # 2. Вырезаем горизонтальную полосу
                 bbox = (0, top, page.width, bottom)
                 try:
                     crop = page.within_bbox(bbox)
                 except ValueError:
                     continue
                     
-                # Читаем текст внутри полосы, сохраняя визуальные пробелы (layout=True)
                 text = crop.extract_text(layout=True)
                 if not text:
                     continue
                     
-                # 3. Ищем ВСЕ заказы внутри этой полосы (универсальный паттерн для любых серий)
-                # Ловит старые с дефисами и новые (любые буквы + от 10 до 15 цифр)
+                # 3. Ищем ВСЕ заказы внутри этой полосы (любые серии Ozon)
                 order_pattern = r'(\d{8,15}-\d{4}-\d+|[a-zA-Z]{0,4}\d{10,15})'
                 orders_in_slice = re.findall(order_pattern, text)
                 
                 if not orders_in_slice:
                     continue
                     
+                # Вычисляем 4-значные коды, чтобы потом вырезать их из названия
+                short_codes = []
+                for order in orders_in_slice:
+                    order_norm = order.lower().replace('і', 'i').replace('І', 'i')
+                    if '-' not in order_norm:
+                        short_codes.append(order_norm[-4:])
+                    else:
+                        short_codes.append(order_norm.split('-')[0][-4:])
+                        
                 # 4. Очищаем текст от номеров заказов
                 text_clean = re.sub(order_pattern, ' ', text)
                 
-                # 5. УДАЛЯЕМ ПОРЯДКОВЫЕ НОМЕРА в начале строк (отделены | или пробелом)
-                text_clean = re.sub(r'(?m)^\s*\d+\s*\|', ' ', text_clean)
-                text_clean = re.sub(r'(?m)^\s*\d+\s{3,}', ' ', text_clean)
-                text_clean = text_clean.replace('|', ' ')
-                
-                # 6. Удаляем шапку таблицы (если она попала в срез)
+                # 5. Удаляем шапку таблицы и палочки
                 headers = r'(Склад МСК ООО.*?|Склад:.*?|Служба доставки:.*?|Номер отправления|Номер с этикетки|Количество отправлений|Дата:|Фото|Товар|Артикул|Кол-во|Этикетка|Ozon|Проверьте список.*?отменять их\.|№)'
                 text_clean = re.sub(headers, ' ', text_clean, flags=re.IGNORECASE)
+                text_clean = text_clean.replace('|', ' ')
                 
-                # 7. Ищем Артикул и Кол-во строго в конце строк
-                art_qty_matches = list(re.finditer(r'\s{2,}([A-Za-z0-9\-_А-Яа-я/.]+)\s+(\d{1,3})(?:\s+\d{4})?\s*$', text_clean, re.MULTILINE))
+                # 6. Ищем Артикул и Кол-во (ТЕПЕРЬ ДОСТАТОЧНО 1 ПРОБЕЛА: \s+)
+                art_qty_matches = list(re.finditer(r'\s+([A-Za-z0-9\-_А-Яа-я/.]+)\s+(\d{1,4})(?:\s+\d{4})?\s*$', text_clean, re.MULTILINE))
                 
                 articles = []
                 qtys = []
@@ -95,12 +98,21 @@ def parse_assembly_list(pdf_file):
                 articles.reverse()
                 qtys.reverse()
                 
-                # 8. Всё, что осталось после удаления номеров и артикулов — это чистое Название!
+                # 7. ГЕНЕРАЛЬНАЯ УБОРКА НАЗВАНИЯ ТОВАРА
+                # Удаляем ВСЕ порядковые номера в начале строк (даже если их несколько подряд)
+                name_text = re.sub(r'(?m)^\s*(?:\d+\s+)+', ' ', name_text)
+                
+                # Удаляем 4-значные коды этикеток, если Озон засунул их внутрь текста
+                for code in short_codes:
+                    if code.isdigit():
+                        name_text = re.sub(rf'\b{code}\b', ' ', name_text)
+                        
+                # Убираем лишние пробелы
                 name = re.sub(r'\s+', ' ', name_text).strip()
                 if not name or len(name) < 2:
                     name = "Товар"
                     
-                # 9. Раздаем извлеченные данные всем заказам в этой полосе
+                # 8. Раздаем извлеченные данные заказам
                 for j, order in enumerate(orders_in_slice):
                     art = articles[min(j, len(articles)-1)] if articles else "-"
                     qty = qtys[min(j, len(qtys)-1)] if qtys else "1"
@@ -109,7 +121,6 @@ def parse_assembly_list(pdf_file):
                     
                     order_norm = order.lower().replace('і', 'i').replace('І', 'i')
                     
-                    # Универсальная привязка по 4 последним цифрам (не зависит от серии 500 или 501)
                     if '-' not in order_norm:
                         code = order_norm[-4:]
                     else:
@@ -117,7 +128,6 @@ def parse_assembly_list(pdf_file):
                         
                     data[code] = item
                     
-                    # Резервная привязка по числовому коду
                     num_key = re.sub(r'\D', '', order_norm)
                     data[num_key] = item
                     if len(num_key) >= 10:
@@ -202,7 +212,6 @@ if labels_file and assembly_file:
                 clean_text = re.sub(r'\s+', '', text_no_underscores)
                 
                 clean_text_norm = clean_text.lower().replace('і', 'i').replace('І', 'i')
-                # Универсальный поиск: номера с дефисами ИЛИ буквы + от 10 цифр подряд
                 order_match = re.search(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z]{0,4}\d{10,15})', clean_text_norm)
                 
                 w, h = float(page.mediabox.width), float(page.mediabox.height)
@@ -210,7 +219,6 @@ if labels_file and assembly_file:
                 if order_match:
                     full_num = order_match.group(1)
                     
-                    # Универсальное извлечение последних 4 цифр (без привязки к серии 500)
                     if '-' not in full_num:
                         short_code = full_num[-4:]
                     else:
@@ -218,7 +226,6 @@ if labels_file and assembly_file:
                         
                     info = assembly_data.get(short_code)
                             
-                    # Страховочный поиск по числовому ключу
                     if not info:
                         num_key = re.sub(r'\D', '', full_num)
                         info = assembly_data.get(num_key)
