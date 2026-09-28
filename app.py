@@ -59,16 +59,18 @@ def parse_assembly_list(pdf_file):
                 if not text:
                     continue
                     
-                # 3. Ищем ВСЕ заказы внутри этой полосы
-                orders_in_slice = re.findall(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z0-9]{0,3}500\d{6,10})', text)
+                # 3. Ищем ВСЕ заказы внутри этой полосы (универсальный паттерн для любых серий)
+                # Ловит старые с дефисами и новые (любые буквы + от 10 до 15 цифр)
+                order_pattern = r'(\d{8,15}-\d{4}-\d+|[a-zA-Z]{0,4}\d{10,15})'
+                orders_in_slice = re.findall(order_pattern, text)
+                
                 if not orders_in_slice:
                     continue
                     
                 # 4. Очищаем текст от номеров заказов
-                text_clean = re.sub(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z0-9]{0,3}500\d{6,10})', ' ', text)
+                text_clean = re.sub(order_pattern, ' ', text)
                 
-                # 5. УДАЛЯЕМ ПОРЯДКОВЫЕ НОМЕРА (10, 11, 12) в начале строк. 
-                # Они либо отделены палочкой |, либо большим пробелом
+                # 5. УДАЛЯЕМ ПОРЯДКОВЫЕ НОМЕРА в начале строк (отделены | или пробелом)
                 text_clean = re.sub(r'(?m)^\s*\d+\s*\|', ' ', text_clean)
                 text_clean = re.sub(r'(?m)^\s*\d+\s{3,}', ' ', text_clean)
                 text_clean = text_clean.replace('|', ' ')
@@ -77,14 +79,14 @@ def parse_assembly_list(pdf_file):
                 headers = r'(Склад МСК ООО.*?|Склад:.*?|Служба доставки:.*?|Номер отправления|Номер с этикетки|Количество отправлений|Дата:|Фото|Товар|Артикул|Кол-во|Этикетка|Ozon|Проверьте список.*?отменять их\.|№)'
                 text_clean = re.sub(headers, ' ', text_clean, flags=re.IGNORECASE)
                 
-                # 7. Ищем Артикул и Кол-во строго в конце строк (используем \s{2,} чтобы случайно не отрезать часть названия)
+                # 7. Ищем Артикул и Кол-во строго в конце строк
                 art_qty_matches = list(re.finditer(r'\s{2,}([A-Za-z0-9\-_А-Яа-я/.]+)\s+(\d{1,3})(?:\s+\d{4})?\s*$', text_clean, re.MULTILINE))
                 
                 articles = []
                 qtys = []
                 name_text = text_clean
                 
-                # Вырезаем найденные Артикулы и Количество из текста (идем с конца, чтобы не сбить индексы)
+                # Вырезаем найденные Артикулы и Количество из текста
                 for match in reversed(art_qty_matches):
                     articles.append(match.group(1))
                     qtys.append(match.group(2))
@@ -107,8 +109,8 @@ def parse_assembly_list(pdf_file):
                     
                     order_norm = order.lower().replace('і', 'i').replace('І', 'i')
                     
-                    # Привязываем товар по 4 последним цифрам
-                    if '500' in order_norm:
+                    # Универсальная привязка по 4 последним цифрам (не зависит от серии 500 или 501)
+                    if '-' not in order_norm:
                         code = order_norm[-4:]
                     else:
                         code = order_norm.split('-')[0][-4:]
@@ -200,15 +202,16 @@ if labels_file and assembly_file:
                 clean_text = re.sub(r'\s+', '', text_no_underscores)
                 
                 clean_text_norm = clean_text.lower().replace('і', 'i').replace('І', 'i')
-                order_match = re.search(r'(\d{8,15}-\d{4}-\d+|ii\d{9,15}|[a-zA-Z0-9]{0,3}500\d{6,10})', clean_text_norm)
+                # Универсальный поиск: номера с дефисами ИЛИ буквы + от 10 цифр подряд
+                order_match = re.search(r'(\d{8,15}-\d{4}-\d+|[a-zA-Z]{0,4}\d{10,15})', clean_text_norm)
                 
                 w, h = float(page.mediabox.width), float(page.mediabox.height)
                 
                 if order_match:
                     full_num = order_match.group(1)
                     
-                    # Ищем привязку по 4 последним цифрам
-                    if '500' in full_num:
+                    # Универсальное извлечение последних 4 цифр (без привязки к серии 500)
+                    if '-' not in full_num:
                         short_code = full_num[-4:]
                     else:
                         short_code = full_num.split('-')[0][-4:]
